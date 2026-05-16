@@ -1,90 +1,106 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Eddie Allan
+
 import os
 import sys
+from pathlib import Path
+
 import pythonnet
 
-def _initialize_bridge():
-    """Initializes the CLR bridge to the bundled Kusto.Language DLLs."""
+
+_HOMEBREW_OPT_PATHS = [
+    Path("/opt/homebrew/opt/dotnet/libexec"),
+    Path("/usr/local/opt/dotnet/libexec"),
+]
+
+_SYSTEM_PATHS = [
+    Path("/usr/share/dotnet"),
+    Path("/usr/local/share/dotnet"),
+]
+
+_USER_PATHS = [Path.home() / ".dotnet"]
+
+
+def _is_dotnet_root(path: Path) -> bool:
+    return path.is_dir() and (path / "host" / "fxr").is_dir()
+
+
+def _candidate_dotnet_roots():
+    for p in _HOMEBREW_OPT_PATHS + _SYSTEM_PATHS + _USER_PATHS:
+        if _is_dotnet_root(p):
+            yield p
+
+
+def _load_runtime() -> None:
+    if pythonnet.get_runtime_info():
+        return
+
+    if os.environ.get("DOTNET_ROOT"):
+        pythonnet.load("coreclr")
+        return
+
     try:
-        if not pythonnet.get_runtime_info():
-            pythonnet.load("coreclr")
-    except Exception as e:
-        raise RuntimeError(f"Failed to initialize .NET runtime. Ensure .NET 8.0+ is installed. Error: {e}")
+        pythonnet.load("coreclr")
+        return
+    except Exception:
+        pass
+
+    for root in _candidate_dotnet_roots():
+        try:
+            pythonnet.load("coreclr", dotnet_root=str(root))
+            return
+        except Exception:
+            continue
+
+    hint_paths = "\n  ".join(str(p) for p in _HOMEBREW_OPT_PATHS + _SYSTEM_PATHS)
+    raise RuntimeError(
+        "Failed to initialize the .NET runtime for pykusto-language.\n"
+        "Install .NET 8.0+ and either set DOTNET_ROOT or place dotnet at one of:\n"
+        f"  {hint_paths}\n"
+        "On macOS: `brew install dotnet` (auto-detected) or set "
+        "DOTNET_ROOT=/opt/homebrew/opt/dotnet/libexec for Apple Silicon."
+    )
+
+
+def _initialize_bridge() -> None:
+    _load_runtime()
 
     import clr
 
-    # Locate the bin directory relative to this file
     base_dir = os.path.dirname(os.path.abspath(__file__))
     bin_dir = os.path.join(base_dir, "bin")
 
-    # Add to path and reference the primary assembly
     if bin_dir not in sys.path:
         sys.path.append(bin_dir)
-    
+
     try:
         clr.AddReference("Kusto.Language")
     except Exception as e:
         raise ImportError(
-            f"Could not load Kusto.Language assembly. Ensure Kusto.Language.dll is in {bin_dir}. Error: {e}"
-        )
+            f"Could not load Kusto.Language assembly. "
+            f"Ensure Kusto.Language.dll is in {bin_dir}. Error: {e}"
+        ) from e
 
-# Initialize on import
+
 _initialize_bridge()
 
-import clr
-import System
-from Kusto.Language import KustoCode, GlobalState
-from Kusto.Language.Syntax import SyntaxNode, SyntaxVisitor
-from Kusto.Language.Symbols import TableSymbol, ColumnSymbol, DatabaseSymbol, ScalarTypes
+from Kusto.Language import KustoCode, GlobalState  # noqa: E402
+from Kusto.Language.Editor import KustoCodeService, FormattingOptions  # noqa: E402
+from Kusto.Language.Symbols import (  # noqa: E402
+    TableSymbol,
+    ColumnSymbol,
+    DatabaseSymbol,
+    ScalarTypes,
+)
 
-# Stubborn types that fail direct import in some environments
-def get_net_type(fullname):
-    t = System.Type.GetType(f"{fullname}, Kusto.Language")
-    if t is None:
-        # Fallback search through assemblies
-        for assembly in System.AppDomain.CurrentDomain.GetAssemblies():
-            if assembly.GetName().Name == "Kusto.Language":
-                t = assembly.GetType(fullname)
-                if t: break
-    return t
-
-_KustoFormatter = get_net_type("Kusto.Language.Editor.KustoFormatter")
-_FormattingOptions = get_net_type("Kusto.Language.Editor.FormattingOptions")
-
-def call_static(type_obj, method_name, *args):
-    """Helper to call static methods via reflection when pythonnet mapping fails."""
-    # Convert Python types to .NET types explicitly
-    net_args = []
-    for arg in args:
-        if isinstance(arg, bool):
-            net_args.append(System.Boolean(arg))
-        elif isinstance(arg, int):
-            # Try to be smart about 32 vs 64 bit, but default to 32 for now as most KQL APIs use it
-            net_args.append(System.Int32(arg))
-        elif arg is None:
-            net_args.append(None)
-        else:
-            net_args.append(arg)
-            
-    net_args_array = System.Array[System.Object](net_args)
-    
-    # Try to find the method that matches the argument count
-    methods = type_obj.GetMethods()
-    for m in methods:
-        if m.Name == method_name and m.GetParameters().Length == len(args):
-            return m.Invoke(None, net_args_array)
-            
-    raise AttributeError(f"Method {method_name} with {len(args)} parameters not found on {type_obj.FullName}")
 
 __all__ = [
-    "KustoCode", 
-    "GlobalState", 
-    "SyntaxNode", 
-    "SyntaxVisitor", 
-    "TableSymbol", 
-    "ColumnSymbol", 
-    "DatabaseSymbol", 
+    "KustoCode",
+    "GlobalState",
+    "KustoCodeService",
+    "FormattingOptions",
+    "TableSymbol",
+    "ColumnSymbol",
+    "DatabaseSymbol",
     "ScalarTypes",
-    "call_static",
-    "_KustoFormatter",
-    "_FormattingOptions"
 ]

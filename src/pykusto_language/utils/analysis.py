@@ -1,104 +1,216 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Eddie Allan
+
 import hashlib
-import json
-from ..bridge import (
-    GlobalState, TableSymbol, ColumnSymbol, DatabaseSymbol, ScalarTypes,
-    KustoCode
-)
 
-class KustoWalker:
-    """Base class for manual AST traversal to ensure DRY across analysis tools."""
-    def visit(self, node):
-        if node is None:
-            return
-        
-        self.pre_visit(node)
-        
+from ..bridge import ColumnSymbol, TableSymbol
+from .schema_state import build_global_state  # re-exported
+from .walker import KustoWalker, node_to_dict  # re-exported
+
+__all__ = [
+    "build_global_state",
+    "find_table_references",
+    "get_operator_chain",
+    "get_operator_stats",
+    "get_referenced_columns",
+    "get_structural_hash",
+    "get_tables_semantic",
+    "get_tables_syntactic",
+    "get_time_range",
+    "KustoWalker",
+    "node_to_dict",
+    "replace_table",
+]
+
+
+# See pykusto_language.reflection.time_functions for the reflected source.
+try:
+    from ..reflection import time_functions as _time_functions
+
+    _TIME_FUNCS = _time_functions()
+except Exception:  # pragma: no cover — defensive
+    _TIME_FUNCS = frozenset({
+        "ago", "now", "datetime", "startofday", "endofday",
+        "startofweek", "endofweek", "startofmonth", "endofmonth",
+        "startofyear", "endofyear", "bin", "format_datetime", "todatetime",
+        "totimespan", "datetime_add", "datetime_diff",
+    })
+
+_STRUCTURAL_NOISE_KINDS = frozenset({"List", "SeparatedElement"})
+
+_TIME_LITERAL_KINDS = frozenset({
+    "DateTimeLiteralExpression", "TimespanLiteralExpression",
+})
+
+
+def _path_expression_table(node):
+    """Yield the trailing NameReference of a PathExpression source
+    (``database("d").T``, ``cluster("c").database("d").T``)."""
+    right = node.GetChild(2)
+    if right is None:
+        return
+    yield from _unwrap_table_expr(right)
+
+
+def _unwrap_table_expr(node):
+    """Yield candidate NameReference nodes that occupy a table-source position."""
+    if node is None:
+        return
+    kind = str(node.Kind)
+    if kind == "NameReference":
+        yield node
+        return
+    if kind == "ParenthesizedExpression":
         for i in range(node.ChildCount):
-            child = node.GetChild(i)
-            if child is not None:
-                self.visit(child)
-        
-        self.post_visit(node)
+            yield from _unwrap_table_expr(node.GetChild(i))
+        return
+    if kind in _STRUCTURAL_NOISE_KINDS:
+        for i in range(node.ChildCount):
+            yield from _unwrap_table_expr(node.GetChild(i))
+        return
+    if kind == "PipeExpression":
+        # Leftmost child is the source table feeding this sub-pipeline.
+        yield from _unwrap_table_expr(node.GetChild(0))
+        return
+    if kind == "PathExpression":
+        yield from _path_expression_table(node)
+        return
 
-    def pre_visit(self, node):
-        pass
 
-    def post_visit(self, node):
-        pass
+def _is_function_callee(node) -> bool:
+    """True when this NameReference is the callee of a FunctionCallExpression.
 
-class TableExtractor(KustoWalker):
-    def __init__(self, semantic=False):
-        self.tables = set()
-        self.let_variables = set()
-        self.semantic = semantic
+    Uses positional equality (TextStart/Width) because pythonnet returns fresh
+    wrapper objects on each .NET property access, making `is` unreliable.
+    """
+    parent = node.Parent
+    if parent is None or str(parent.Kind) != "FunctionCallExpression":
+        return False
+    callee = parent.GetChild(0)
+    return (
+        callee is not None
+        and callee.TextStart == node.TextStart
+        and callee.Width == node.Width
+    )
 
-    def pre_visit(self, node):
-        kind = str(node.Kind)
-        
-        if kind == "LetStatement":
-            name_node = node.GetChild(1)
-            if name_node:
-                self.let_variables.add(name_node.ToString().strip())
 
-        if self.semantic and hasattr(node, "ReferencedSymbol") and node.ReferencedSymbol:
+def _collect_table_refs(syntax) -> list:
+    """Return every (name, NameReference node) that occupies a table-source
+    position. Filters out let-bound names but does NOT deduplicate by name —
+    callers that want a set should dedupe themselves.
+    """
+    let_vars = set()
+    refs = []
+
+    class Walker(KustoWalker):
+        def pre_visit(self, node):
+            kind = str(node.Kind)
+
+            if kind == "LetStatement":
+                name_node = node.GetChild(1)
+                if name_node is not None:
+                    let_vars.add(name_node.ToString().strip())
+                rhs = node.GetChild(3)
+                if rhs is not None:
+                    for ref in _unwrap_table_expr(rhs):
+                        refs.append(ref)
+                return
+
+            if kind in ("PipeExpression", "ExpressionStatement"):
+                for ref in _unwrap_table_expr(node.GetChild(0)):
+                    refs.append(ref)
+                return
+
+            if kind in ("JoinOperator", "LookupOperator", "FacetOperator"):
+                expr = getattr(node, "Expression", None)
+                if expr is not None:
+                    for ref in _unwrap_table_expr(expr):
+                        refs.append(ref)
+                return
+
+            if kind == "UnionOperator":
+                for i in range(node.ChildCount):
+                    for ref in _unwrap_table_expr(node.GetChild(i)):
+                        refs.append(ref)
+
+    Walker().visit(syntax)
+    out = []
+    for ref in refs:
+        name = ref.ToString().strip()
+        if not name or name in let_vars:
+            continue
+        out.append((name, ref))
+    return out
+
+
+def _collect_semantic_table_refs(syntax) -> list:
+    """Return every (name, node) where node.ReferencedSymbol is a TableSymbol.
+
+    Does NOT dedupe by name — callers that want a set should dedupe themselves.
+    """
+    refs = []
+
+    class Walker(KustoWalker):
+        def pre_visit(self, node):
+            if str(node.Kind) != "NameReference":
+                return
             sym = node.ReferencedSymbol
-            if "TableSymbol" in str(sym.GetType().FullName):
-                self.tables.add(sym.Name)
-        
-        elif kind == "NameReference":
-            parent = node.Parent
-            if parent is not None:
-                parent_kind = str(parent.Kind)
-                is_source = False
-                if parent_kind in ["ExpressionStatement", "PipeExpression"]:
-                    if parent.GetChild(0) == node:
-                        is_source = True
-                elif "Operator" in parent_kind and parent.GetChild(0) == node:
-                    is_source = True
-                
-                if is_source:
-                    name = node.ToString().strip()
-                    if name and name not in self.let_variables:
-                        self.tables.add(name)
+            if sym is None:
+                return
+            if isinstance(sym, TableSymbol):
+                refs.append((sym.Name, node))
+
+    Walker().visit(syntax)
+    return refs
+
+
+def find_table_references(kusto_code, force_syntactic: bool = False) -> list:
+    """Return [(name, node), ...] for every table reference (one entry per
+    occurrence). Use ``get_referenced_tables`` for a deduplicated set of names.
+    """
+    if not force_syntactic and kusto_code.HasSemantics:
+        return _collect_semantic_table_refs(kusto_code.Syntax)
+    return _collect_table_refs(kusto_code.Syntax)
+
 
 def get_tables_syntactic(kusto_code) -> set[str]:
-    extractor = TableExtractor(semantic=False)
-    extractor.visit(kusto_code.Syntax)
-    return extractor.tables
+    return {name for name, _ in _collect_table_refs(kusto_code.Syntax)}
 
-def create_global_state(schema_dict: dict):
-    tables = []
-    for table_name, columns in schema_dict.items():
-        col_symbols = [ColumnSymbol(c, ScalarTypes.String) for c in columns]
-        tables.append(TableSymbol(table_name, col_symbols))
-    return GlobalState.Default.WithDatabase(DatabaseSymbol("NetDB", tables))
 
-def get_tables_semantic(kusto_code, schema: dict) -> set[str]:
-    state = create_global_state(schema)
-    analyzed = KustoCode.ParseAndAnalyze(kusto_code.Text, state)
-    extractor = TableExtractor(semantic=True)
-    extractor.visit(analyzed.Syntax)
-    return extractor.tables
+def get_tables_semantic(kusto_code) -> set[str]:
+    """Return tables resolved by the binder. Requires a bound KustoCode."""
+    if not kusto_code.HasSemantics:
+        raise ValueError(
+            "get_tables_semantic requires a bound KustoCode "
+            "(use parse(text, schema=...))."
+        )
+    return {name for name, _ in _collect_semantic_table_refs(kusto_code.Syntax)}
 
-def get_operator_stats(kusto_code) -> dict:
+
+def get_operator_stats(kusto_code) -> dict[str, int]:
+    counts: dict[str, int] = {}
+
     class OperatorCounter(KustoWalker):
-        def __init__(self):
-            self.counts = {}
         def pre_visit(self, node):
             kind = str(node.Kind)
             if "Operator" in kind:
-                self.counts[kind] = self.counts.get(kind, 0) + 1
-    counter = OperatorCounter()
-    counter.visit(kusto_code.Syntax)
-    return counter.counts
+                counts[kind] = counts.get(kind, 0) + 1
+
+    OperatorCounter().visit(kusto_code.Syntax)
+    return counts
+
 
 def get_operator_chain(kusto_code) -> list:
+    """Flatten pipe expressions into a left-to-right list of operator nodes."""
     chain = []
+
     def walk(node):
-        if node is None: return
+        if node is None:
+            return
         kind = str(node.Kind)
-        if kind == "QueryBlock" or "List" in kind or kind == "SeparatedElement":
-            for i in range(node.ChildCount): walk(node.GetChild(i))
+        if kind == "QueryBlock" or kind in _STRUCTURAL_NOISE_KINDS:
+            for i in range(node.ChildCount):
+                walk(node.GetChild(i))
         elif kind == "ExpressionStatement":
             walk(node.GetChild(0))
         elif kind == "PipeExpression":
@@ -106,79 +218,155 @@ def get_operator_chain(kusto_code) -> list:
             chain.append(node.GetChild(2))
         elif "Operator" in kind or kind == "NameReference":
             chain.append(node)
+
     walk(kusto_code.Syntax)
     return chain
 
-def node_to_dict(node):
-    if node is None: return None
-    result = {"kind": str(node.Kind), "text": node.ToString().strip(), "children": []}
-    for i in range(node.ChildCount):
-        child = node.GetChild(i)
-        if child is not None: result["children"].append(node_to_dict(child))
-    return result
 
-def get_referenced_columns(kusto_code) -> set[str]:
-    extractor = TableExtractor(semantic=False)
-    extractor.visit(kusto_code.Syntax)
-    class ColumnExtractor(KustoWalker):
-        def __init__(self, tables, variables):
-            self.columns = set()
-            self.tables = tables
-            self.variables = variables
+def get_referenced_columns(kusto_code, force_syntactic: bool = False) -> set[str]:
+    """Return the set of column names referenced in the query.
+
+    Semantic mode keeps only NameReferences whose ReferencedSymbol is a
+    ColumnSymbol — function names and aliases drop out naturally. Syntactic
+    mode skips function callees but cannot distinguish columns from aliases.
+    """
+    if not force_syntactic and kusto_code.HasSemantics:
+        cols = set()
+
+        class Walker(KustoWalker):
+            def pre_visit(self, node):
+                if str(node.Kind) != "NameReference":
+                    return
+                sym = node.ReferencedSymbol
+                if sym is not None and isinstance(sym, ColumnSymbol):
+                    cols.add(sym.Name)
+
+        Walker().visit(kusto_code.Syntax)
+        return cols
+
+    table_names = {name for name, _ in _collect_table_refs(kusto_code.Syntax)}
+    let_vars = set()
+
+    class LetCollector(KustoWalker):
         def pre_visit(self, node):
-            if str(node.Kind) == "NameReference":
-                name = node.ToString().strip()
-                if name and name not in self.tables and name not in self.variables:
-                    self.columns.add(name)
-    col_extractor = ColumnExtractor(extractor.tables, extractor.let_variables)
-    col_extractor.visit(kusto_code.Syntax)
-    return col_extractor.columns
+            if str(node.Kind) == "LetStatement":
+                name_node = node.GetChild(1)
+                if name_node is not None:
+                    let_vars.add(name_node.ToString().strip())
+
+    LetCollector().visit(kusto_code.Syntax)
+
+    cols = set()
+
+    class ColumnExtractor(KustoWalker):
+        def pre_visit(self, node):
+            if str(node.Kind) != "NameReference":
+                return
+            if _is_function_callee(node):
+                return
+            name = node.ToString().strip()
+            if not name or name in table_names or name in let_vars:
+                return
+            # `$left` / `$right` and other `$`-prefixed names are KQL macros.
+            if name.startswith("$"):
+                return
+            cols.add(name)
+
+    ColumnExtractor().visit(kusto_code.Syntax)
+    return cols
+
 
 def get_structural_hash(kusto_code) -> str:
-    struct_str = []
+    """SHA256 over the AST shape — dedupes queries that differ only in literal
+    values or whitespace. Not a logical-equivalence hash: parenthesization and
+    other cosmetic rewrites may still produce different hashes.
+    """
+    parts = []
+
     class HashWalker(KustoWalker):
         def pre_visit(self, node):
             kind = str(node.Kind)
-            struct_str.append(kind)
-            # Skip children for literals to treat them as atomic structural units
-            if "LiteralExpression" in kind: return
+            if kind in _STRUCTURAL_NOISE_KINDS:
+                return
+            if "Token" in kind:
+                return
+            parts.append(kind)
+
     HashWalker().visit(kusto_code.Syntax)
-    return hashlib.sha256("".join(struct_str).encode()).hexdigest()
+    return hashlib.sha256("".join(parts).encode()).hexdigest()
 
-def get_time_range(kusto_code) -> list[str]:
-    time_filters = []
-    class TimeWalker(KustoWalker):
+
+def get_time_range(kusto_code) -> list[tuple[str, int, int]]:
+    """Return [(text, start, length), ...] for every time-related expression in
+    source order: time-function calls (``ago``, ``now``, ``bin``, ...) plus
+    standalone datetime/timespan literals not already inside a matched call.
+    """
+    fn_ranges = []  # (start, end) of matched time-function calls
+    out = []
+
+    class FnPass(KustoWalker):
         def pre_visit(self, node):
-            text = node.ToString()
-            if any(k in text for k in ["ago(", "datetime(", "now()"]):
-                if node.ChildCount == 0 or str(node.Kind) == "FunctionCallExpression":
-                    time_filters.append(text.strip())
-    TimeWalker().visit(kusto_code.Syntax)
-    return list(set(time_filters))
+            if str(node.Kind) != "FunctionCallExpression":
+                return
+            callee = node.GetChild(0)
+            if callee is None:
+                return
+            if callee.ToString().strip() not in _TIME_FUNCS:
+                return
+            start = node.TextStart
+            end = start + node.Width
+            fn_ranges.append((start, end))
+            out.append((node.ToString().strip(), start, node.Width))
 
-def replace_table(kusto_code, old_name: str, new_name: str) -> str:
+    FnPass().visit(kusto_code.Syntax)
+
+    def _within_function(start: int, end: int) -> bool:
+        return any(fs <= start and end <= fe for fs, fe in fn_ranges)
+
+    class LiteralPass(KustoWalker):
+        def pre_visit(self, node):
+            if str(node.Kind) not in _TIME_LITERAL_KINDS:
+                return
+            start = node.TextStart
+            end = start + node.Width
+            if _within_function(start, end):
+                return
+            out.append((node.ToString().strip(), start, node.Width))
+
+    LiteralPass().visit(kusto_code.Syntax)
+
+    seen = set()
+    deduped = []
+    for entry in out:
+        key = (entry[1], entry[2])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    deduped.sort(key=lambda t: t[1])
+    return deduped
+
+
+def replace_table(kusto_code, old_name: str, new_name: str, force_syntactic: bool = False) -> str:
+    """Rename every reference to ``old_name`` to ``new_name``; return the new text.
+
+    Semantic mode replaces every NameReference whose ReferencedSymbol is the
+    matching TableSymbol (covers join/union/lookup). Syntactic mode matches by
+    source position via the same allowlist used by ``find_table_references``.
+    """
+    refs = find_table_references(kusto_code, force_syntactic=force_syntactic)
+    seen = set()
     replacements = []
-    class ReplaceWalker(KustoWalker):
-        def pre_visit(self, node):
-            if str(node.Kind) == "NameReference" and node.ToString().strip() == old_name:
-                parent = node.Parent
-                if parent and (str(parent.Kind) in ["ExpressionStatement", "PipeExpression"] or "Operator" in str(parent.Kind)):
-                    replacements.append((node.TextStart, node.Width))
-    ReplaceWalker().visit(kusto_code.Syntax)
-    text = kusto_code.Text
-    for start, length in sorted(replacements, reverse=True):
-        text = text[:start] + new_name + text[start+length:]
-    return text
+    for name, node in refs:
+        if name != old_name:
+            continue
+        key = (node.TextStart, node.Width)
+        if key in seen:
+            continue
+        seen.add(key)
+        replacements.append(key)
 
-def mask_literals(kusto_code, mask="'<REDACTED>'") -> str:
-    literals = []
-    class LiteralMasker(KustoWalker):
-        def pre_visit(self, node):
-            kind = str(node.Kind)
-            if "LiteralExpression" in kind and "String" in kind:
-                literals.append((node.TextStart, node.Width))
-    LiteralMasker().visit(kusto_code.Syntax)
     text = kusto_code.Text
-    for start, length in sorted(literals, reverse=True):
-        text = text[:start] + mask + text[start+length:]
+    for start, length in sorted(replacements, key=lambda t: t[0], reverse=True):
+        text = text[:start] + new_name + text[start + length:]
     return text
