@@ -1,61 +1,99 @@
-# AI Agent Intelligence: KQL Wrapper Guidelines
+# AI Agent Notes: pykusto-language
 
-This document provides foundational technical context and mandatory patterns for agents modifying this repository. It captures critical structural realizations and .NET interop requirements discovered during implementation.
+Non-obvious technical context for agents modifying this repository. Read
+before changing CLR interop, the AST analysis layer, or the bundled DLL.
 
-## .NET Runtime and pythonnet Interop
+## .NET runtime and pythonnet interop
 
-### Observation: The Stubborn Type Impasse
-Certain static classes in the `Kusto.Language.Editor` namespace (e.g., `KustoFormatter`) are visible to the CLR but fail to map into the Python namespace via standard import mechanisms.
-- **Rule**: Do not attempt direct imports for these types. 
-- **Mandate**: Utilize the reflection-based fallback in `bridge.py`. Access these types via the internal `_KustoFormatter` reference and use the `call_static` helper.
+### Use the public `KustoCodeService` for formatting
+`Kusto.Language.Editor.KustoFormatter` is `internal` — not part of the public
+API. The supported public path is
+`Kusto.Language.Editor.KustoCodeService.GetFormattedText()`, which returns a
+`FormattedText` with a `.Text` property. Use this; do not reflect into
+`KustoFormatter`.
 
-### Observation: Type Conversion and Signatures
-Pythonnet's implicit conversion can fail on specific .NET signatures, particularly with numeric types and nulls.
-- **Rule**: Reflection-based calls require explicit type casting for .NET parameters.
-- **Mandate**: When using `call_static`, wrap Python integers in `System.Int32()` and explicitly handle nulls to match the .NET method signature exactly.
+```python
+from Kusto.Language.Editor import KustoCodeService
+text = KustoCodeService(query).GetFormattedText().Text
+```
 
-### Observation: CoreCLR Initialization
-On non-Windows platforms, pythonnet may default to searching for a Mono runtime, which leads to initialization failures.
-- **Mandate**: Always call `pythonnet.load("coreclr")` explicitly before importing `clr`. This logic is centralized in `bridge.py`.
+### CoreCLR initialization on macOS / Linux
+- pythonnet defaults to Mono off-Windows; we always call
+  `pythonnet.load("coreclr")` first.
+- On Homebrew macOS the runtime layout differs from Microsoft's installer:
+  `libhostfxr.dylib` lives under `<dotnet>/libexec/host/fxr/`, not
+  `<dotnet>/bin/host/fxr/`. `clr_loader.find_dotnet_root()` falls back to the
+  parent of `which dotnet`, which is wrong for Homebrew.
+- `bridge.py` runs a cascade: honor `DOTNET_ROOT`, try the default load, then
+  probe `/opt/homebrew/opt/dotnet/libexec`,
+  `/usr/local/opt/dotnet/libexec`, `/usr/share/dotnet`,
+  `/usr/local/share/dotnet`, `~/.dotnet`. Probing the `opt` symlink (not the
+  `Cellar/X.Y.Z/` path) keeps detection stable across `brew upgrade`.
 
-## AST Structure and Navigation
+## AST structure and navigation
 
-### Observation: Left-Associative Binary Trees
-The Kusto AST is structured as a left-associative binary tree. A pipe chain (e.g., `A | B | C`) is nested as `PipeExpression(PipeExpression(A, B), C)`.
-- **Context**: The primary data source is often the deepest leftmost leaf.
-- **Mandate**: When extracting sources, recursively traverse `GetChild(0)` until a `NameReference` or similar terminal node is reached.
+### Left-associative pipe expressions
+A pipe chain `A | B | C` is parsed as `PipeExpression(PipeExpression(A, B), C)`.
+The leftmost source is the deepest `GetChild(0)`. For `PipeExpression`:
+- `GetChild(0)` — left-hand expression (previous part of the pipeline).
+- `GetChild(1)` — `|` token.
+- `GetChild(2)` — right-hand operator (e.g. `FilterOperator`).
 
-### Observation: Structural vs. Semantic Nodes
-The AST contains numerous structural wrappers (e.g., `SeparatedElement`, `SyntaxList`, `ExpressionStatement`) that do not carry logical weight but must be traversed.
-- **Mandate**: Use the `walk_tree.py` example to map the specific path to semantic nodes before implementing new analysis logic.
+### Source positions
+Use `node.TextStart` and `node.Width` for offset-based replacements. Process
+replacements back-to-front so earlier offsets remain valid. Do not use
+`node.Start` / `node.Length`.
 
-### Observation: Node Property Access
-Nodes expose both semantic properties (e.g., `node.Condition`) and raw index-based slots (e.g., `node.GetChild(1)`). 
-- **Rule**: .NET properties accessed via pythonnet may return types that require explicit string conversion.
-- **Mandate**: Always use `.ToString()` for text extraction from .NET nodes to bypass pythonnet's implicit conversion limits.
+### Semantic vs. syntactic
+- `KustoCode.Parse(text)` returns a syntactic-only tree.
+- `KustoCode.ParseAndAnalyze(text, globals)` runs the binder, populating
+  `node.ReferencedSymbol`.
+- The library exposes both via `parse(query)` and
+  `parse(query, schema={...})`. Analyzers in `utils/analysis.py` dispatch on
+  `KustoCode.HasSemantics`; semantic results are preferred when available.
 
-### Observation: PipeExpression Child Indices
-In a `PipeExpression` node, children are indexed as follows:
-- `GetChild(0)`: The left-hand expression (previous part of the pipeline).
-- `GetChild(1)`: The `|` token (`BarToken`).
-- `GetChild(2)`: The right-hand operator (e.g., `FilterOperator`, `SummarizeOperator`).
-- **Mandate**: When flattening the pipeline into an operator chain, always target index 2 for the semantic operator.
+### Schemas
+- Dict form: `{"TableName": {"col": "string", "n": "long"}}` — types resolved
+  via `ScalarTypes.GetSymbol`.
+- String form: `"(col:string, n:long)"` — passed to `TableSymbol.From`
+  (Microsoft's parser).
+- Both flow through `utils/analysis.build_global_state`.
 
-## Analysis Logic
+### Path expressions: `database("d").T` and `cluster("c").database("d").T`
+Modeled as `PathExpression(left, dot, right)` where `right` is the trailing
+table identifier. `_unwrap_table_expr` descends into the right child so
+syntactic table extraction still resolves `T`. Replacement targets only `T`,
+not the `database(...)`/`cluster(...)` calls.
 
-### Observation: Structural Hashing
-The library provides a `get_structural_hash()` utility that generates a SHA256 fingerprint based on node kinds while ignoring literal values and whitespace.
-- **Rule**: This is intended for query deduplication and templating.
+### Structural wrappers
+The AST contains `List`, `SeparatedElement`, and similar wrappers with no
+logical weight. The `KustoWalker` base in `utils/analysis.py` traverses them
+transparently. When matching node kinds, **use exact equality on a closed
+set** rather than substring matches like `"List" in kind` (which falsely
+matches `NameReferenceList`, `RenameList`, `JsonArrayExpression`, etc.).
 
-### Observation: AST-based Table Replacement
-The `replace_table()` utility performs surgical renaming by identifying `NameReference` nodes in source positions and replacing their source text based on exact offsets.
-- **Mandate**: This method is preferred over string regex replacement as it preserves the AST integrity and avoids accidental keyword replacement.
+### pythonnet identity gotcha
+`parent.GetChild(0) is node` is unreliable: pythonnet returns fresh wrapper
+objects on each .NET property access. Compare positions instead:
 
-### Observation: Table vs. Variable Distinction
-A `NameReference` node may refer to a physical table or a local variable defined in a `let` statement.
-- **Rule**: Syntactic analysis must be stateful.
-- **Mandate**: Track names defined in `LetStatement` nodes during traversal. Exclude these names from primary data source extraction results.
+```python
+callee = parent.GetChild(0)
+return callee.TextStart == node.TextStart and callee.Width == node.Width
+```
 
-### Observation: Source Offsets
-AST nodes use `TextStart` and `Width` for positioning within the source text, not `Start` or `Length`.
-- **Mandate**: Use `node.TextStart` and `node.Width` for all offset-based calculations. When performing text replacements (e.g., masking), process the source from back to front to maintain offset validity.
+## Bundled DLL
+
+`src/pykusto_language/bin/Kusto.Language.dll` comes from the
+`Microsoft.Azure.Kusto.Language` NuGet package. The version is pinned in
+`bin/VERSION.txt` (package, version, sha256, refresh date) and in
+`pyproject.toml` under `[tool.pykusto-language]`. Refresh with:
+
+```bash
+python scripts/refresh_dll.py             # uses the pinned version
+python scripts/refresh_dll.py --version X.Y.Z --pin
+```
+
+`--pin` updates `pyproject.toml` and `bin/VERSION.txt` together. After
+refreshing, run `python scripts/verify_dll.py` and the full test suite —
+upstream parser changes can shift diagnostic codes (`KS204` etc.) or rename
+AST kinds.
