@@ -17,7 +17,7 @@ Microsoft Sentinel.
 | Tier | Install | Adds |
 |---|---|---|
 | 1 — thin .NET wrapper | `pip install pykusto-language` | `KustoCode`, `KustoQuery`, `parse`, `format_query`, `validate`. Full Microsoft API surface via `pykusto_language.bridge.*`. |
-| 2 — semantic IR | `pip install 'pykusto-language[ir]'` | An **intermediate representation** (IR) of the parsed query as pydantic models — typed operators, expressions, and source spans — plus a schema binder for column-flow analysis. |
+| 2 — semantic IR | `pip install 'pykusto-language[ir]'` | An **intermediate representation** (IR) of the parsed query as pydantic models — typed operators, expressions, and source spans — plus `SchemaAttacher` for propagating Microsoft's binding results through the pipeline into serializable fields. |
 
 The two tiers compose: `KustoQuery.to_ir()` builds the IR from the same parsed
 AST tier 1 produced — there is no double parse.
@@ -27,69 +27,66 @@ from pykusto_language import parse
 
 q = parse("StormEvents | where EventType == 'Tornado' | summarize count() by State")
 ir = q.to_ir()                # tier 2: pydantic IR
-ops = q.get_operator_chain()  # tier 1: raw .NET AST walk
+ops = q.get_operator_chain()  # tier 1: Microsoft AST walk
 ```
 
 ## What's the IR?
 
-**IR** stands for *intermediate representation*: a higher-level model of a
-parsed KQL query than the raw .NET syntax tree exposed by tier 1.
+The **IR** (intermediate representation) is a higher-level model of a
+parsed KQL query. Tier 1 exposes Microsoft's native syntax tree — the
+same tree used internally by the parser. Tier 2 reshapes that tree
+into pydantic models: a `Pipeline` of typed operators (`FilterOp`,
+`JoinOp`, `SummarizeOp`, …), typed expressions (`BinOp`, `FuncCall`,
+`SetMembership`, …), and source spans.
 
-Tier 1 hands you the unmodified Microsoft AST — useful for source-level
-rewrites and direct interop, hostile to Python work (every traversal goes
-through `pythonnet`, every node is a .NET object). Tier 2's IR is the same
-query expressed as **pydantic models**: a `Pipeline` of typed operators
-(`FilterOp`, `JoinOp`, `SummarizeOp`, …), each carrying typed expressions
-(`BinOp`, `FuncCall`, `SetMembership`, …) and source spans.
+What the IR adds on top of the syntax tree:
 
-The IR is the **semantic layer**:
+- **Typed.** Every node is a pydantic model, so analyzers dispatch by
+  `isinstance(op, FilterOp)` rather than by string-matching node kinds.
+- **Serializable.** `model_dump_json` round-trips losslessly through
+  `QueryIR.model_validate_json`; nothing crosses process boundaries by
+  reference. `to_llm_dict` produces a trimmed projection (~50% smaller)
+  tailored for handing to a language model.
+- **Materialized binding.** `SchemaAttacher(schemas)` walks the pipeline
+  and writes resolved column types and owning-table provenance into
+  pydantic fields, plus a `Pipeline.result_schema` capturing the final
+  column shape — so binding survives serialization and is available
+  without re-querying the AST.
+- **Explicit coverage tracking.** Shapes the IR doesn't model yet
+  surface as `UnknownExpr` / `UnknownSource`. A coverage audit fails CI
+  when those grow beyond a baseline, so the IR's coverage of Microsoft's
+  grammar is measurable over time.
 
-- **Typed.** Every node is a pydantic model. Operator and expression families
-  are explicit, so analyzers dispatch by `isinstance(op, FilterOp)` rather
-  than by string matching on `node.Kind`.
-- **Serializable.** `model_dump_json` round-trips losslessly. No .NET object
-  references leak out — the IR can cross process boundaries.
-- **Schema-aware.** `SchemaAttacher(schemas)` walks the pipeline and fills
-  `result_type` and column→table provenance, including across joins, lookups,
-  and unions.
-- **Hash-stable.** Two queries that differ only in whitespace produce the same
-  `structural_hash` — useful for de-duplication.
-- **Explicit fallbacks.** Anything the builder doesn't model surfaces as
-  `UnknownExpr` / `UnknownSource` rather than a silent gap. A coverage audit
-  fails CI when those grow beyond a baseline.
+## Choosing a tier
 
-Use the IR for analyzers (lint, lineage, anti-pattern detection), query
-introspection (UI displays, JSON APIs), or anywhere you'd rather work with
-`op.predicate.left.name` than `node.GetChild(0).GetChild(2).Name.ToString()`.
+Both tiers share the same parser; pick based on what shape of data your
+code wants to work with.
 
-## Stability policy
+| | Tier 1 — thin wrapper | Tier 2 — semantic IR |
+|---|---|---|
+| **Install** | `pip install pykusto-language` | `pip install 'pykusto-language[ir]'` |
+| **Dependencies** | `pythonnet` + .NET 8 runtime | adds `pydantic` |
+| **Returns** | `KustoQuery` wrapping Microsoft's syntax tree | `QueryIR` — pydantic models |
+| **Traversal** | Microsoft AST (`node.Kind` dispatch via `pythonnet`) | Typed pipeline (`isinstance` dispatch) |
+| **Serialization** | `KustoQuery.to_dict()` / `to_json()` | `model_dump_json` (lossless) + `to_llm_dict` (LLM-tailored) |
+| **Schema binding** | `parse(query, schema=...)` runs Microsoft's binder — semantic diagnostics plus symbol resolution accessible via AST methods | `SchemaAttacher` materializes those binding results into pydantic fields and computes `Pipeline.result_schema` |
+| **Stability** | SemVer-stable | Pre-1.0; minor-version breaking changes documented in CHANGELOG |
+| **Best for** | Formatting / linting, IDE integrations, extracting referenced tables/columns/operators, surgical table renames | Lineage and anti-pattern analyzers, JSON-serializable query representations for APIs and UIs, schema-aware column flow, LLM-fed query graphs |
 
-**Tier 1** — `pykusto_language` top-level surface (`parse`, `format_query`,
-`validate`, `KustoQuery`, the reflection helpers, the `pykusto` CLI) follows
-[Semantic Versioning](https://semver.org/). What counts as a breaking change:
+## Stability
 
-- Renaming or removing a public function, class, or method.
-- Changing a public function's signature (parameter names, order, defaults).
-- Removing a CLI subcommand, renaming a flag, or changing its default value.
-- Changing the documented exit codes of any CLI subcommand.
-- Changing the JSON output shape of `pykusto parse --json`, `pykusto
-  validate --json`, or `IRBuilder.build(...).model_dump_json()`.
-- Removing or renaming a re-export from `pykusto_language` or
-  `pykusto_language.ir`.
+**Tier 1** — the `pykusto_language` top-level surface (`parse`,
+`format_query`, `validate`, `KustoQuery`, the reflection helpers, the
+`pykusto` CLI) follows [Semantic Versioning](https://semver.org/).
+Public signatures, default values, CLI flags and exit codes, and the
+JSON output shape of `pykusto parse --json` / `pykusto validate --json`
+are all part of the stable contract.
 
-**Tier 2** — `pykusto_language.ir.*` (the pydantic IR, the binder, the IR
-walker utilities) is on a pre-1.0 track. Minor breaking changes are possible
-at minor versions until the IR survives one Kusto.Language.dll upgrade cycle
-without breaking. Each break is called out explicitly in `CHANGELOG.md`.
-Specifically, the following may change in a tier-2 minor release:
-
-- IR node field names, defaults, or types.
-- The set of recognized `SyntaxKind` dispatch entries.
-- The `Pipeline.source` union members (e.g. `TableRef`, `LetRef`, `ImplicitSource`).
-- Binder enrichment fields (`result_type`, `nullable`, `canonical_form`).
-
-When tier 2 lands a breaking change, the CHANGELOG names the affected
-classes / fields and gives the migration. We do not silently shift shapes.
+**Tier 2** — `pykusto_language.ir.*` is pre-1.0. The IR shape (node
+field names and types, the `Pipeline.source` union, binder enrichment
+fields, recognized `SyntaxKind` dispatch entries) may change at minor
+versions until it survives one Kusto.Language.dll upgrade cycle without
+breakage. Each break is named in `CHANGELOG.md` with a migration path.
 
 ## Capabilities
 
@@ -118,8 +115,10 @@ classes / fields and gives the migration. We do not silently shift shapes.
 - **`IRBuilder.build(query)`** — parse, bind, and build the IR in one call.
 - **`IRBuilder.build_from_code(code)`** — build from a pre-parsed `KustoCode`.
   `KustoQuery.to_ir()` uses this so callers don't pay for two parses.
-- **`SchemaAttacher(schemas)`** — annotates the IR with column types and
-  owning-table provenance from a flat `{table: {col: type}}` dict.
+- **`SchemaAttacher(schemas)`** — propagates Microsoft's binding results
+  into pydantic fields (`Expr.result_type`, `ColumnRef.table`) and computes
+  `Pipeline.result_schema` for the post-pipeline column shape. Takes a flat
+  `{table: {col: type}}` dict.
 - **`QueryIR.to_llm_dict()`** — lossy projection optimized for handing the
   IR to a language model: every node carries a `kind` discriminator, spans
   and defaulted fields are stripped, and `polarity` is collapsed into
@@ -223,15 +222,6 @@ All subcommands also read from stdin when `file` is `-` or omitted. Exit codes:
 4. **Tier-2 IR layer** (`pykusto_language.ir`, optional): pydantic `QueryIR`,
    `IRBuilder`, and `SchemaAttacher`. Activated by
    `pip install 'pykusto-language[ir]'`.
-
-### When to use tier 1 vs tier 2
-
-- **Tier 1**: format/lint pipelines, IDE integrations, simple analyzers that
-  ask "what tables / columns / operators does this query touch?"
-- **Tier 2**: structured analyzers (lineage, anti-pattern detection,
-  contradiction checks), JSON-serializable query representations for APIs and
-  UIs, schema-aware column-flow analysis. Anything that wants pydantic models
-  with source-span provenance instead of raw .NET AST nodes.
 
 ## Verifying the bundled DLL
 
